@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정에 따라 몇 분~수십 분 늦어질 수 있음)
   workflow_dispatch:         # Actions 탭에서 수동 실행 (테스트용)
+    inputs:
+      test_notify:
+        description: "텔레그램 알림만 테스트"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,6 +31,13 @@ jobs:
           path: .cgv_state.json
           key: cgv-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: cgv-state-
+
+      - name: Test Telegram
+        if: ${{ inputs.test_notify }}
+        run: python3 cgv_open_alert.py --test-notify
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Check CGV schedule
         run: python3 cgv_open_alert.py --once --state-file .cgv_state.json

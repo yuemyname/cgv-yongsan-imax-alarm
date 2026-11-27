@@ -11,8 +11,8 @@ GitHub Actions가 5분마다 CGV 공개 시간표를 조회해서, 용산아이�
 3. 저장소 **Settings → Secrets and variables → Actions → New repository secret**
    - `TELEGRAM_BOT_TOKEN`
    - `TELEGRAM_CHAT_ID`
-4. **Actions 탭 → "CGV 용산 IMAX 오픈 알림" → Run workflow** 로 첫 실행
-   - "✅ 알리미가 시작됐어요" 메시지가 오면 성공. 이후 5분마다 자동 실행됩니다.
+4. **Actions 탭 → "CGV 용산 IMAX 오픈 알림" → Run workflow** 에서 `텔레그램 알림만 테스트` 를 체크하고 실행
+   - "🔔 CGV 알리미 테스트" 메시지가 오면 성공. 이후 5분마다 자동 실행됩니다.
 
 ## 참고
 
