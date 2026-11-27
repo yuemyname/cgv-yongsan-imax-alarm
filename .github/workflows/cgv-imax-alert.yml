@@ -1,0 +1,42 @@
+name: CGV 용산 IMAX 오픈 알림
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정에 따라 몇 분~수십 분 늦어질 수 있음)
+  workflow_dispatch:         # Actions 탭에서 수동 실행 (테스트용)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cgv-imax-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      # 이전 실행 결과(이미 알린 회차 목록) 불러오기
+      - name: Restore state
+        uses: actions/cache/restore@v5
+        with:
+          path: .cgv_state.json
+          key: cgv-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: cgv-state-
+
+      - name: Check CGV schedule
+        run: python3 cgv_open_alert.py --once --state-file .cgv_state.json
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # 이번 결과 저장 (다음 실행이 불러감)
+      - name: Save state
+        if: always() && hashFiles('.cgv_state.json') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: .cgv_state.json
+          key: cgv-state-${{ github.run_id }}-${{ github.run_attempt }}
