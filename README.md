@@ -20,3 +20,16 @@ GitHub Actions가 5분마다 CGV 공개 시간표를 조회해서, 용산아이�
 - 30분 정도 조회가 계속 실패하면 경고 알림이 한 번 옵니다 (CGV API 변경 또는 차단 가능성)
 - 끄려면 Actions 탭에서 워크플로 → `···` → Disable workflow
 - Public 저장소는 60일 동안 커밋이 없으면 GitHub이 예약 실행을 자동으로 멈춥니다. 메일이 오면 다시 Enable 하면 됩니다.
+
+## AWS Lambda (서울 리전) 버전 — 현재 운영 중
+
+CGV는 해외 IP(GitHub Actions)를 차단해서, 실제 운영은 `lambda/lambda_function.py` 를 AWS Lambda 서울 리전에서 돌립니다.
+
+- 함수: `cgv-test` (ap-northeast-2), 런타임 Python 3.13, 제한 시간 2분
+- 실행 주기: EventBridge 규칙 `cgv-imax-alert-every-5min` — `rate(5 minutes)`
+- 상태 저장: S3 버킷 `cgv-imax-alert-state-497597443603` 의 `cgv-imax-state.json`
+- 환경변수: `STATE_BUCKET`(필수), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `MOVIE_KEYWORD`(선택)
+- 텔레그램 테스트: Lambda 테스트 이벤트로 `{"test_notify": true}` 실행
+- 끄기: Lambda → 구성 → 트리거에서 EventBridge 규칙 비활성화
+
+GitHub Actions 워크플로는 비활성화되어 있습니다.
