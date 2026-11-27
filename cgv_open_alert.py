@@ -185,6 +185,13 @@ def run_once(state_path: Path) -> None:
 
 
 def main():
+    # Windows 콘솔(cp949)에서 이모지 출력 때문에 죽지 않도록
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except AttributeError:
+            pass
+
     p = argparse.ArgumentParser(description="CGV 용산아이파크몰 IMAX 예매 오픈 알리미")
     p.add_argument("--once", action="store_true", help="한 번만 조회하고 종료 (GitHub Actions용)")
     p.add_argument("--state-file", default=str(Path(__file__).resolve().parent / ".cgv_state.json"))
