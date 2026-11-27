@@ -25,12 +25,27 @@ GitHub Actions가 5분마다 CGV 공개 시간표를 조회해서, 용산아이�
 
 CGV는 해외 IP(GitHub Actions)를 차단해서, 실제 운영은 `lambda/lambda_function.py` 를 AWS Lambda 서울 리전에서 돌립니다.
 
-- 감시 대상: 서울 IMAX 5곳 (용산아이파크몰, 압구정, 영등포타임스퀘어, 왕십리, 천호). 환경변수 `SITE_NOS` 로 변경 가능
-- 함수: `cgv-test` (ap-northeast-2), 런타임 Python 3.13, 제한 시간 3분 (1회 실행 약 50초)
-- 실행 주기: EventBridge 규칙 `cgv-imax-alert-every-5min` — `rate(5 minutes)`
-- 상태 저장: S3 버킷 `cgv-imax-alert-state-497597443603` 의 `cgv-imax-state.json`
-- 환경변수: `STATE_BUCKET`(필수), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `SITE_NOS`, `MOVIE_KEYWORD`(선택)
-- 텔레그램 테스트: Lambda 테스트 이벤트로 `{"test_notify": true}` 실행
-- 끄기: Lambda → 구성 → 트리거에서 EventBridge 규칙 비활성화
+### 구독자용 사용법 (텔레그램 봇)
+- `/start` — 안내 + 극장 선택 버튼
+- `/settings` — 알림 받을 극장 켜고 끄기 (용산아이파크몰, 압구정, 영등포타임스퀘어, 왕십리, 천호)
+- `/status` — 구독 중인 극장 보기
+- `/stop` — 알림 끄기
+
+### 구성
+- 함수: `cgv-test` (ap-northeast-2), Python 3.13, 제한 시간 3분
+- 5분 조회: EventBridge 규칙 `cgv-imax-alert-every-5min` — 구독자가 있는 극장만 조회, 구독자별로 자기 극장 알림만 발송
+- 봇 명령: Lambda Function URL(인증 NONE) → 텔레그램 웹훅. 텔레그램 비밀 토큰 헤더로 요청 검증(토큰에서 파생, 별도 설정 불필요)
+- S3 버킷 `cgv-imax-alert-state-497597443603`: `cgv-imax-state.json`(본 회차/추적 극장), `subscribers.json`(구독자별 극장)
+- 새로 구독자가 생긴 극장은 기존 회차로 알림을 보내지 않고 기준선만 잡음
+- 봇을 차단한 구독자는 자동 삭제, 조회 실패 경고는 관리자(`TELEGRAM_CHAT_ID`)에게만
+- 환경변수: `STATE_BUCKET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `MOVIE_KEYWORD`(선택)
+
+### 관리자용 테스트 이벤트
+- `{"test_notify": true}` — 관리자에게 테스트 알림
+- `{"setup_webhook": "<Function URL>"}` — 웹훅/명령 메뉴 (재)등록. 봇 토큰을 바꾸면 다시 실행
+
+### 끄기
+- 조회 중지: Lambda → 구성 → 트리거에서 EventBridge 규칙 비활성화
+- 봇 중지: Function URL 삭제
 
 GitHub Actions 워크플로는 비활성화되어 있습니다.
