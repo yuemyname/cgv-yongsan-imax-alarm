@@ -1,12 +1,13 @@
 """
-CGV 서울 IMAX 예매 오픈 알리미 - AWS Lambda (서울 리전) 버전, 구독자별 극장 선택
+CGV 서울 IMAX 예매 오픈 알리미 - AWS Lambda (서울 리전) 버전, 구독자별 극장/영화 선택
 
 하나의 Lambda 가 세 가지 일을 합니다.
   1) EventBridge 1분 스케줄  -> 구독자가 있는 극장만 조회, 새 IMAX 회차를 구독자별로 알림
      기본: 매분 모든 날짜 확인 (극장들은 동시에 조회)
      FULL_SCAN_SEC 를 주면: 그 간격으로만 전체 조회, 나머지는 새 날짜 + IMAX 없는 날짜만 (빠른 조회)
      (실행이 겹치면 건너뜀, 연속 실패 시 조회 간격을 2,4,8..최대 30분으로 늘림)
-  2) Function URL (텔레그램 웹훅) -> 구독자가 봇에서 극장을 고르는 명령/버튼 처리
+     구독자가 고른 영화만 알림. 단, 극장에 처음 IMAX 예매가 열린 영화는 영화 선택과 상관없이 알림
+  2) Function URL (텔레그램 웹훅) -> 구독자가 봇에서 극장/영화를 고르는 명령/버튼 처리
   3) 콘솔 테스트 이벤트       -> {"test_notify": true}, {"setup_webhook": "<Function URL>"}
 조회만 합니다 (로그인/예매/결제 없음).
 
@@ -18,9 +19,9 @@ CGV 서울 IMAX 예매 오픈 알리미 - AWS Lambda (서울 리전) 버전, 구
   FULL_SCAN_SEC       전체 날짜 조회 간격(초). 기본 0 = 매번 전체 조회, 290 = 약 5분마다 (선택)
 
 S3 파일
-  cgv-imax-state.json   이미 본 회차, 추적 중인 극장, 연속 실패 횟수
+  cgv-imax-state.json   이미 본 회차, 추적 중인 극장, 극장별로 본 IMAX 영화, 연속 실패 횟수
   scan.lock             실행 중 표시 (겹침 방지)
-  subscribers.json      구독자별 선택 극장
+  subscribers.json      구독자별 선택 극장/영화 (movies 가 없으면 전체 영화)
 """
 
 import base64
@@ -62,7 +63,8 @@ LOCK_TTL_SEC = 150  # 이보다 오래된 잠금은 비정상 종료로 보고 �
 FULL_SCAN_SEC = int(os.getenv("FULL_SCAN_SEC", "0") or 0)  # 0 = 매번 전체 조회
 STATE_KEY = "cgv-imax-state.json"
 SUBS_KEY = "subscribers.json"
-STATE_VERSION = 3  # v3: 추적 극장(tracked) 추가
+STATE_VERSION = 4  # v3: 추적 극장(tracked), v4: 극장별로 본 IMAX 영화(known)
+KNOWN_KEEP_DAYS = 60  # 마지막 상영일이 이보다 오래 지난 영화는 잊음 (재개봉하면 다시 '첫 오픈')
 KST = timezone(timedelta(hours=9))
 
 ON = "✅"
@@ -70,6 +72,7 @@ OFF = "⬜"
 ICON_OPEN = "\U0001F3AC"
 ICON_TEST = "\U0001F514"
 ICON_WARN = "⚠️"
+ICON_NEW = "\U0001F195"
 
 s3 = boto3.client("s3")
 
@@ -94,6 +97,21 @@ def fmt_date(ymd):
 
 def site_names(nos):
     return ", ".join(SEOUL_IMAX[n] for n in SEOUL_IMAX if n in nos) or "없음"
+
+
+def mov_no(s):
+    return str(s.get("movNo") or s.get("movNm") or s.get("prodNm") or "")
+
+
+def mov_name(s):
+    return s.get("movNm") or s.get("prodNm") or s.get("expoProdNm") or mov_no(s)
+
+
+def movie_names(movies):
+    """구독자의 movies 값(None = 전체, dict = 고른 영화) 을 글로"""
+    if movies is None:
+        return "전체 영화"
+    return ", ".join(sorted(movies.values())) or "없음 (처음 열리는 영화만)"
 
 
 # ───────────────────────── 텔레그램 ─────────────────────────
@@ -193,10 +211,13 @@ def update_subs(fn):
 
 # ───────────────────────── 봇 (웹훅) ─────────────────────────
 HELP = ("CGV 서울 IMAX 예매 오픈 알리미예요.\n"
-        "선택한 극장에 새 IMAX 회차가 열리면 1~2분 안에 알려드려요.\n\n"
+        "선택한 극장에 새 IMAX 회차가 열리면 1~2분 안에 알려드려요.\n"
+        "처음으로 IMAX 예매가 열린 영화는 영화 선택과 상관없이 알려드려요.\n\n"
         "/settings - 알림 받을 극장 고르기\n"
-        "/status - 지금 구독 중인 극장\n"
+        "/movies - 알림 받을 영화 고르기\n"
+        "/status - 지금 설정 보기\n"
         "/stop - 알림 끄기")
+FIRST_NOTE = "처음으로 IMAX 예매가 열리는 영화는 항상 알려드려요."
 
 
 def keyboard(selected):
@@ -213,19 +234,61 @@ def settings_text(selected):
             f"현재: {site_names(selected)}")
 
 
+def current_movies():
+    """지금 서울 IMAX 극장에서 예매가 열려 있는 IMAX 영화 {movNo: 이름}"""
+    today = now_kst().strftime("%Y%m%d")
+    out = {}
+    for by_mov in load_state()["known"].values():
+        for no, (name, last) in by_mov.items():
+            if last >= today:
+                out[no] = name
+    return out
+
+
+def movie_keyboard(movies, showing):
+    """movies: None = 전체 영화, dict = 고른 영화. showing: 지금 열린 IMAX 영화"""
+    listed = dict(showing)
+    listed.update(movies or {})  # 골랐지만 지금은 상영이 없는 영화도 끌 수 있게
+    rows = [[{"text": f"{ON if movies is None else OFF} 전체 영화 (새로 열리는 영화 포함)",
+              "callback_data": "ma"}]]
+    for no, name in sorted(listed.items(), key=lambda x: x[1])[:40]:
+        mark = ON if movies is not None and no in movies else OFF
+        tail = "" if no in showing else " (상영 없음)"
+        rows.append([{"text": f"{mark} {name}{tail}"[:60], "callback_data": f"m:{no}"[:64]}])
+    rows.append([{"text": "완료", "callback_data": "mdone"}])
+    return {"inline_keyboard": rows}
+
+
+def movies_text(movies, showing):
+    head = ("알림 받을 영화를 고르세요. 영화를 하나라도 고르면 고른 영화만 알려드려요.\n"
+            if showing or movies else "아직 확인된 IMAX 영화가 없어요.\n")
+    return f"{head}현재: {movie_names(movies)}\n{FIRST_NOTE}"
+
+
+def status_text(entry):
+    return (f"극장: {site_names(entry.get('sites', []))}\n"
+            f"영화: {movie_names(entry.get('movies'))}\n{FIRST_NOTE}\n"
+            "변경: /settings (극장), /movies (영화)")
+
+
 def handle_message(msg):
     chat_id = str(msg["chat"]["id"])
     text = (msg.get("text") or "").strip()
     cmd = text.split()[0].split("@")[0].lower() if text else ""
     subs, _ = load_subs()
-    mine = subs.get(chat_id, {}).get("sites", [])
+    entry = subs.get(chat_id, {})
+    mine = entry.get("sites", [])
 
     if cmd in ("/start", "/settings"):
         if cmd == "/start":
             send(chat_id, HELP)
         send(chat_id, settings_text(mine), reply_markup=keyboard(mine))
+    elif cmd == "/movies":
+        showing = current_movies()
+        movies = entry.get("movies")
+        send(chat_id, movies_text(movies, showing), reply_markup=movie_keyboard(movies, showing))
     elif cmd == "/status":
-        send(chat_id, f"구독 중인 극장: {site_names(mine)}\n변경: /settings")
+        send(chat_id, status_text(entry))
     elif cmd == "/stop":
         update_subs(lambda s: s.pop(chat_id, None))
         send(chat_id, "알림을 껐어요. 다시 받으려면 /start 를 눌러 주세요.")
@@ -233,15 +296,34 @@ def handle_message(msg):
         send(chat_id, HELP)
 
 
+def _edit(chat_id, message_id, **params):
+    try:
+        tg("editMessageText", chat_id=chat_id, message_id=message_id, **params)
+    except TelegramError as e:
+        if "not modified" not in e.desc:
+            raise
+
+
 def handle_callback(cb):
     chat_id = str(cb["message"]["chat"]["id"])
     message_id = cb["message"]["message_id"]
     data = cb.get("data", "")
     who = cb.get("from", {}).get("first_name", "")
+    showing = None
+    if data == "ma" or data.startswith("m:") or data.startswith("am:"):
+        showing = current_movies()
 
-    def apply(subs):
-        entry = subs.get(chat_id) or {"sites": [], "name": who,
-                                      "joined": now_kst().isoformat(timespec="seconds")}
+    def new_entry():
+        return {"sites": [], "name": who, "joined": now_kst().isoformat(timespec="seconds")}
+
+    def keep(subs, entry):
+        if entry["sites"] or entry.get("movies") is not None:
+            subs[chat_id] = entry
+        else:
+            subs.pop(chat_id, None)
+
+    def apply_sites(subs):
+        entry = subs.get(chat_id) or new_entry()
         sites = set(entry["sites"])
         note = ""
         if data.startswith("t:") and data[2:] in SEOUL_IMAX:
@@ -257,30 +339,78 @@ def handle_callback(cb):
         elif data == "none":
             sites, note = set(), "전체 해제"
         entry["sites"] = [n for n in SEOUL_IMAX if n in sites]
-        if entry["sites"]:
-            subs[chat_id] = entry
-        else:
-            subs.pop(chat_id, None)
+        keep(subs, entry)
         return entry["sites"], note
 
-    if data == "done":
+    def apply_movies(subs):
+        entry = subs.get(chat_id) or new_entry()
+        movies = entry.get("movies")
+        note = ""
+        if data == "ma":
+            movies, note = None, "전체 영화 알림"
+        else:
+            no = data.split(":", 1)[1]
+            name = (showing or {}).get(no) or (movies or {}).get(no) or no
+            if data.startswith("am:"):  # 알림 메시지의 '이 영화 알림 받기' 버튼
+                if movies is None:
+                    note = "이미 전체 영화 알림을 받고 있어요"
+                else:
+                    movies = {**movies, no: name}
+                    note = f"{name} 알림 켬"
+            elif movies is None:  # 전체 -> 이 영화만
+                movies, note = {no: name}, f"{name}만 알림"
+            elif no in movies:
+                movies = {k: v for k, v in movies.items() if k != no}
+                note = f"{name} 알림 끔"
+            else:
+                movies = {**movies, no: name}
+                note = f"{name} 알림 켬"
+        if movies is None:
+            entry.pop("movies", None)
+        else:
+            entry["movies"] = movies
+        keep(subs, entry)
+        return entry.get("movies"), note
+
+    if data in ("done", "mdone"):
         subs, _ = load_subs()
-        mine = subs.get(chat_id, {}).get("sites", [])
+        entry = subs.get(chat_id, {})
         tg("answerCallbackQuery", callback_query_id=cb["id"])
-        tg("editMessageText", chat_id=chat_id, message_id=message_id,
-           text=(f"설정 완료! 알림 받는 극장: {site_names(mine)}\n"
-                 "새 IMAX 회차가 열리면 알려드릴게요. 변경: /settings")
-           if mine else "선택한 극장이 없어서 알림이 오지 않아요. /settings 로 다시 고를 수 있어요.")
+        if not entry.get("sites"):
+            text = "선택한 극장이 없어서 알림이 오지 않아요. /settings 로 다시 고를 수 있어요."
+        elif data == "done":
+            text = (f"설정 완료! 알림 받는 극장: {site_names(entry['sites'])}\n"
+                    f"영화: {movie_names(entry.get('movies'))} (변경: /movies)\n"
+                    "새 IMAX 회차가 열리면 알려드릴게요. 극장 변경: /settings")
+        else:
+            text = f"설정 완료!\n{status_text(entry)}"
+        _edit(chat_id, message_id, text=text)
         return
 
-    _, (mine, note) = update_subs(apply)
+    if data.startswith("am:"):
+        _, (movies, note) = update_subs(apply_movies)
+        tg("answerCallbackQuery", callback_query_id=cb["id"], text=note)
+        # 누른 버튼만 알림 메시지에서 지움
+        rows = (cb["message"].get("reply_markup") or {}).get("inline_keyboard", [])
+        rows = [r for r in rows if not any(b.get("callback_data") == data for b in r)]
+        try:
+            tg("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
+               reply_markup={"inline_keyboard": rows})
+        except TelegramError as e:
+            if "not modified" not in e.desc:
+                raise
+        return
+
+    if data == "ma" or data.startswith("m:"):
+        _, (movies, note) = update_subs(apply_movies)
+        tg("answerCallbackQuery", callback_query_id=cb["id"], text=note)
+        _edit(chat_id, message_id, text=movies_text(movies, showing),
+              reply_markup=movie_keyboard(movies, showing))
+        return
+
+    _, (mine, note) = update_subs(apply_sites)
     tg("answerCallbackQuery", callback_query_id=cb["id"], text=note)
-    try:
-        tg("editMessageText", chat_id=chat_id, message_id=message_id,
-           text=settings_text(mine), reply_markup=keyboard(mine))
-    except TelegramError as e:
-        if "not modified" not in e.desc:
-            raise
+    _edit(chat_id, message_id, text=settings_text(mine), reply_markup=keyboard(mine))
 
 
 def handle_webhook(event):
@@ -306,7 +436,8 @@ def setup_webhook(url):
             allowed_updates=["message", "callback_query"], drop_pending_updates=True)
     r2 = tg("setMyCommands", commands=[
         {"command": "settings", "description": "알림 받을 극장 고르기"},
-        {"command": "status", "description": "구독 중인 극장 보기"},
+        {"command": "movies", "description": "알림 받을 영화 고르기"},
+        {"command": "status", "description": "지금 설정 보기"},
         {"command": "stop", "description": "알림 끄기"},
     ])
     return {"setWebhook": r1, "setMyCommands": r2}
@@ -356,20 +487,26 @@ def scan_site(site_no, today, movie_kw, skip_dates=()):
 def load_state():
     data, _ = s3_get(STATE_KEY)
     if not data:
-        return {"seen": set(), "tracked": set(), "failures": 0, "imax_dates": {}, "full_at": 0}
+        return {"seen": set(), "tracked": set(), "failures": 0, "imax_dates": {}, "full_at": 0,
+                "known": {}}
     st = {"seen": set(data.get("seen", [])), "failures": int(data.get("failures", 0)),
           "tracked": set(data.get("tracked", [])),
           "imax_dates": {k: set(v) for k, v in (data.get("imax_dates") or {}).items()},
-          "full_at": float(data.get("full_at", 0))}
+          "full_at": float(data.get("full_at", 0)),
+          # 극장별로 IMAX 예매가 열린 적 있는 영화 {극장: {movNo: [이름, 마지막 상영일]}}
+          # v3 에서 올라오면 비어 있음 -> 다음 조회에서 알림 없이 채움
+          "known": {k: {m: list(v) for m, v in by.items()}
+                    for k, by in (data.get("known") or {}).items()}}
     if data.get("v") == 2:  # 서울 5곳 전체를 추적하던 이전 버전
         st["tracked"] = set(SEOUL_IMAX)
-    elif data.get("v") != STATE_VERSION:  # 그보다 오래된 형식은 처음부터
+    elif data.get("v") not in (3, STATE_VERSION):  # 그보다 오래된 형식은 처음부터
         st["seen"], st["tracked"] = set(), set()
     return st
 
 
 def save_state(st):
     today = now_kst().strftime("%Y%m%d")
+    forget = (now_kst() - timedelta(days=KNOWN_KEEP_DAYS)).strftime("%Y%m%d")
     s3_put(STATE_KEY, {
         "v": STATE_VERSION,
         "seen": sorted(k for k in st["seen"] if k[:8] >= today and key_site(k) in st["tracked"]),
@@ -377,17 +514,21 @@ def save_state(st):
         "failures": st["failures"],
         "imax_dates": {k: sorted(d for d in v if d >= today)
                        for k, v in st["imax_dates"].items() if k in st["tracked"]},
+        "known": {k: {m: v for m, v in by.items() if v[1] >= forget}
+                  for k, by in st["known"].items() if k in st["tracked"]},
         "full_at": st["full_at"],
         "updated": now_kst().isoformat(timespec="seconds"),
     })
 
 
-def build_alert(shows):
+def build_alert(shows, firsts=()):
+    """shows: [(극장, 회차)], firsts: 이번에 처음 IMAX 예매가 열린 (극장, movNo)"""
     grouped = {}
     for site_no, s in sorted(shows, key=lambda x: (list(SEOUL_IMAX).index(x[0]), x[1]["scnYmd"],
                                                    str(x[1].get("scnsrtTm")))):
+        name = mov_name(s) + (f" {ICON_NEW}" if (site_no, mov_no(s)) in firsts else "")
         grouped.setdefault(site_no, {}).setdefault(s["scnYmd"], {}).setdefault(
-            s.get("movNm") or s.get("prodNm"), []).append(fmt_time(s.get("scnsrtTm")))
+            name, []).append(fmt_time(s.get("scnsrtTm")))
     lines = []
     for site_no, by_day in grouped.items():
         lines.append(f"[{SEOUL_IMAX[site_no]}]")
@@ -395,8 +536,10 @@ def build_alert(shows):
             for mv, times in movies.items():
                 lines.append(f"• {fmt_date(ymd)} {mv}: {', '.join(times)}")
     names = ", ".join(SEOUL_IMAX[n] for n in grouped)
-    return (f"{ICON_OPEN} IMAX 예매 오픈! {names} 새 회차 {len(shows)}개\n"
-            + "\n".join(lines[:50]) + f"\n{BOOKING_URL}\n\n알림 극장 변경: /settings")
+    first_names = sorted({mov_name(s) for site_no, s in shows if (site_no, mov_no(s)) in firsts})
+    head = (f"{ICON_NEW} 새 영화 IMAX 예매 첫 오픈! {', '.join(first_names)}\n" if first_names else "")
+    return (head + f"{ICON_OPEN} IMAX 예매 오픈! {names} 새 회차 {len(shows)}개\n"
+            + "\n".join(lines[:50]) + f"\n{BOOKING_URL}\n\n변경: /settings (극장), /movies (영화)")
 
 
 def acquire_lock():
@@ -495,15 +638,39 @@ def _run_scan():
     new = {k: s for k, s in found.items() if k not in st["seen"] and key_site(k) in st["tracked"]}
     newly_tracked = ok_sites - st["tracked"]
 
+    # 극장별로 처음 IMAX 예매가 열린 영화. 영화 목록을 처음 만드는 극장(신규 추적, 업그레이드 직후)은 제외
+    firsts = set()
+    for k, s in found.items():
+        site_no, no = key_site(k), mov_no(s)
+        by_mov = st["known"].get(site_no)
+        if by_mov is not None and no not in by_mov and site_no in st["tracked"]:
+            firsts.add((site_no, no))
+    for no_site in ok_sites:
+        st["known"].setdefault(no_site, {})
+    for k, s in found.items():
+        entry = st["known"][key_site(k)].setdefault(mov_no(s), [mov_name(s), s["scnYmd"]])
+        entry[0] = mov_name(s)
+        entry[1] = max(entry[1], s["scnYmd"])
+
     sent = 0
     blocked = []
     if new:
         for chat_id, u in subs.items():
-            mine = [(key_site(k), s) for k, s in new.items() if key_site(k) in u.get("sites", [])]
+            movies = u.get("movies")  # None = 전체 영화
+            mine = [(key_site(k), s) for k, s in new.items()
+                    if key_site(k) in u.get("sites", [])
+                    and (movies is None or mov_no(s) in movies or (key_site(k), mov_no(s)) in firsts)]
             if not mine:
                 continue
+            extra = {}
+            if movies is not None:  # 고르지 않은 첫 오픈 영화는 바로 추가할 수 있게 버튼
+                add = {mov_no(s): mov_name(s) for site_no, s in mine if mov_no(s) not in movies}
+                if add:
+                    extra["reply_markup"] = {"inline_keyboard": [
+                        [{"text": f"➕ {name} 알림 받기"[:60], "callback_data": f"am:{no}"[:64]}]
+                        for no, name in sorted(add.items(), key=lambda x: x[1])[:8]]}
             try:
-                send(chat_id, build_alert(mine))
+                send(chat_id, build_alert(mine, firsts), **extra)
                 sent += 1
             except TelegramError as e:
                 print(f"{chat_id} 전송 실패: {e}")
@@ -523,6 +690,7 @@ def _run_scan():
 
     result = (f"{'full' if full else 'quick'}: subs {len(subs)}, sites {len(needed)}, "
               f"imax {len(found)}, new {len(new)}, "
+              f"first {sorted(no for _, no in firsts)}, "
               f"sent {sent}, baselined {sorted(newly_tracked)}")
     if errors:
         result += f", partial errors {len(errors)}"

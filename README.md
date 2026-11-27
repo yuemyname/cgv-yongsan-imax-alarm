@@ -28,7 +28,9 @@ CGV는 해외 IP(GitHub Actions)를 차단해서, 실제 운영은 `lambda/lambd
 ### 구독자용 사용법 (텔레그램 봇)
 - `/start` — 안내 + 극장 선택 버튼
 - `/settings` — 알림 받을 극장 켜고 끄기 (용산아이파크몰, 압구정, 영등포타임스퀘어, 왕십리, 천호)
-- `/status` — 구독 중인 극장 보기
+- `/movies` — 알림 받을 영화 고르기 (기본: 전체 영화. 하나라도 고르면 고른 영화만)
+- `/status` — 지금 설정(극장, 영화) 보기
+- 극장에 **처음으로 IMAX 예매가 열린 영화**는 영화 선택과 상관없이 알림 (🆕 표시, 알림의 ➕ 버튼으로 바로 영화 추가)
 - `/stop` — 알림 끄기
 
 ### 구성
@@ -38,7 +40,7 @@ CGV는 해외 IP(GitHub Actions)를 차단해서, 실제 운영은 `lambda/lambd
   - CGV 요청을 줄이고 싶으면 환경변수 `FULL_SCAN_SEC=290`: 매분은 새 날짜 + IMAX 없는 날짜만, 약 5분마다 전체 조회
   - 실행이 겹치면 건너뜀(`scan.lock`), 연속 실패 시 2·4·8…최대 30분 간격으로 자동 감속
 - 봇 명령: Lambda Function URL(인증 NONE) → 텔레그램 웹훅. 텔레그램 비밀 토큰 헤더로 요청 검증(토큰에서 파생, 별도 설정 불필요)
-- S3 버킷 `cgv-imax-alert-state-497597443603`: `cgv-imax-state.json`(본 회차/추적 극장/IMAX 있는 날짜), `scan.lock`(겹침 방지), `subscribers.json`(구독자별 극장)
+- S3 버킷 `cgv-imax-alert-state-497597443603`: `cgv-imax-state.json`(본 회차/추적 극장/IMAX 있는 날짜/극장별로 본 IMAX 영화), `scan.lock`(겹침 방지), `subscribers.json`(구독자별 극장/영화)
 - 새로 구독자가 생긴 극장은 기존 회차로 알림을 보내지 않고 기준선만 잡음
 - 봇을 차단한 구독자는 자동 삭제, 조회 실패 경고는 관리자(`TELEGRAM_CHAT_ID`)에게만
 - 환경변수: `STATE_BUCKET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `MOVIE_KEYWORD`(선택), `FULL_SCAN_SEC`(선택, 기본 0)
