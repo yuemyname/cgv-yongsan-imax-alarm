@@ -33,9 +33,12 @@ CGV는 해외 IP(GitHub Actions)를 차단해서, 실제 운영은 `lambda/lambd
 
 ### 구성
 - 함수: `cgv-test` (ap-northeast-2), Python 3.13, 제한 시간 3분
-- 5분 조회: EventBridge 규칙 `cgv-imax-alert-every-5min` — 구독자가 있는 극장만 조회, 구독자별로 자기 극장 알림만 발송
+- 1분 조회: EventBridge 규칙 `cgv-imax-alert-every-5min`(이름만 5min, 실제 `rate(1 minute)`) — 구독자가 있는 극장만 조회, 구독자별로 자기 극장 알림만 발송
+  - 매분 빠른 조회: 새 날짜 + 아직 IMAX가 없는 날짜만 확인 (몇 초)
+  - 약 5분마다 전체 조회: 이미 IMAX가 있는 날짜에 추가된 회차까지 확인
+  - 실행이 겹치면 건너뜀(`scan.lock`), 연속 실패 시 2·4·8…최대 30분 간격으로 자동 감속
 - 봇 명령: Lambda Function URL(인증 NONE) → 텔레그램 웹훅. 텔레그램 비밀 토큰 헤더로 요청 검증(토큰에서 파생, 별도 설정 불필요)
-- S3 버킷 `cgv-imax-alert-state-497597443603`: `cgv-imax-state.json`(본 회차/추적 극장), `subscribers.json`(구독자별 극장)
+- S3 버킷 `cgv-imax-alert-state-497597443603`: `cgv-imax-state.json`(본 회차/추적 극장/IMAX 있는 날짜), `scan.lock`(겹침 방지), `subscribers.json`(구독자별 극장)
 - 새로 구독자가 생긴 극장은 기존 회차로 알림을 보내지 않고 기준선만 잡음
 - 봇을 차단한 구독자는 자동 삭제, 조회 실패 경고는 관리자(`TELEGRAM_CHAT_ID`)에게만
 - 환경변수: `STATE_BUCKET`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `MOVIE_KEYWORD`(선택)
