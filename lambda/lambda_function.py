@@ -3,8 +3,8 @@ CGV 서울 IMAX 예매 오픈 알리미 - AWS Lambda (서울 리전) 버전, 구
 
 하나의 Lambda 가 세 가지 일을 합니다.
   1) EventBridge 1분 스케줄  -> 구독자가 있는 극장만 조회, 새 IMAX 회차를 구독자별로 알림
-     매분: 새 날짜 + 아직 IMAX가 없는 날짜만 확인 (빠른 조회)
-     5분마다: 모든 날짜 확인 (이미 IMAX가 있는 날짜에 회차가 추가되는 경우)
+     기본: 매분 모든 날짜 확인 (극장들은 동시에 조회)
+     FULL_SCAN_SEC 를 주면: 그 간격으로만 전체 조회, 나머지는 새 날짜 + IMAX 없는 날짜만 (빠른 조회)
      (실행이 겹치면 건너뜀, 연속 실패 시 조회 간격을 2,4,8..최대 30분으로 늘림)
   2) Function URL (텔레그램 웹훅) -> 구독자가 봇에서 극장을 고르는 명령/버튼 처리
   3) 콘솔 테스트 이벤트       -> {"test_notify": true}, {"setup_webhook": "<Function URL>"}
@@ -15,6 +15,7 @@ CGV 서울 IMAX 예매 오픈 알리미 - AWS Lambda (서울 리전) 버전, 구
   TELEGRAM_BOT_TOKEN  텔레그램 봇 토큰 (필수)
   TELEGRAM_CHAT_ID    관리자 chat id - 실패 경고 수신, 최초 실행 시 전체 극장 구독으로 등록
   MOVIE_KEYWORD       특정 영화만 받으려면 제목 일부 (선택)
+  FULL_SCAN_SEC       전체 날짜 조회 간격(초). 기본 0 = 매번 전체 조회, 290 = 약 5분마다 (선택)
 
 S3 파일
   cgv-imax-state.json   이미 본 회차, 추적 중인 극장, 연속 실패 횟수
@@ -23,6 +24,7 @@ S3 파일
 """
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
 import json
@@ -57,7 +59,7 @@ FAIL_ALERT_AT = 8  # 백오프 포함 약 30분 이상 연속 실패 시 관리�
 MAX_BACKOFF_MIN = 30
 LOCK_KEY = "scan.lock"
 LOCK_TTL_SEC = 150  # 이보다 오래된 잠금은 비정상 종료로 보고 무시
-FULL_SCAN_SEC = 290  # 전체 날짜 조회 간격 (약 5분)
+FULL_SCAN_SEC = int(os.getenv("FULL_SCAN_SEC", "0") or 0)  # 0 = 매번 전체 조회
 STATE_KEY = "cgv-imax-state.json"
 SUBS_KEY = "subscribers.json"
 STATE_VERSION = 3  # v3: 추적 극장(tracked) 추가
@@ -458,15 +460,19 @@ def _run_scan():
         return "no subscribers"
 
     full = time.time() - st["full_at"] >= FULL_SCAN_SEC
+    # 빠른 조회일 때만 이미 IMAX가 있는 날짜를 건너뜀 (새로 추적하는 극장은 항상 전체 조회)
+    skips = {no: (st["imax_dates"].get(no, set()) if (not full and no in st["tracked"]) else set())
+             for no in needed}
+    # 극장들은 동시에 조회 (극장 안에서는 날짜를 순서대로, 요청 사이 간격 유지)
+    with ThreadPoolExecutor(max_workers=len(needed)) as pool:
+        futures = {no: pool.submit(scan_site, no, today, movie_kw, skips[no]) for no in needed}
     found, ok_sites, errors = {}, set(), []
     for no in needed:
-        # 빠른 조회: 이미 IMAX가 있는 날짜는 건너뜀 (새로 추적하는 극장은 항상 전체 조회)
-        skip = st["imax_dates"].get(no, set()) if (not full and no in st["tracked"]) else set()
         try:
-            f, open_dates, imax_dates = scan_site(no, today, movie_kw, skip)
+            f, open_dates, imax_dates = futures[no].result()
             found.update(f)
             prev = st["imax_dates"].get(no, set())
-            st["imax_dates"][no] = (imax_dates if not skip else (prev & open_dates) | imax_dates)
+            st["imax_dates"][no] = (imax_dates if not skips[no] else (prev & open_dates) | imax_dates)
             ok_sites.add(no)
         except Exception as e:
             errors.append(f"{SEOUL_IMAX[no]}: {e}")
