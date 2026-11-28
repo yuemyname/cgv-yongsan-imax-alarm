@@ -54,3 +54,9 @@ CGV는 해외 IP(GitHub Actions)를 차단해서, 실제 운영은 `lambda/lambd
 - 봇 중지: Function URL 삭제
 
 GitHub Actions 워크플로는 비활성화되어 있습니다.
+
+### 오류 확인
+- CGV 요청이 실패하면 관리자(`TELEGRAM_CHAT_ID`)에게 **바로** 텔레그램 알림: 극장, API(`searchSiteScnscYmdListBySite` 날짜 목록 / `searchMovScnInfo` 상영 회차), HTTP 코드. 같은 오류는 정상화될 때까지 한 번만, 정상화되면 ✅ 복구 알림
+- 로그: CloudWatch → 로그 그룹 `/aws/lambda/cgv-test` → "모든 로그 스트림 검색"에 `"API 오류"`
+- CloudShell(콘솔 오른쪽 위 `>_`)에서:
+  `aws logs filter-log-events --log-group-name /aws/lambda/cgv-test --filter-pattern '"API 오류"' --start-time $(( ($(date +%s)-86400)*1000 )) --query 'events[*].message' --output text`

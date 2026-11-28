@@ -6,6 +6,8 @@ CGV 서울 IMAX 예매 오픈 알리미 - AWS Lambda (서울 리전) 버전, 구
      기본: 매분 모든 날짜 확인 (극장들은 동시에 조회)
      FULL_SCAN_SEC 를 주면: 그 간격으로만 전체 조회, 나머지는 새 날짜 + IMAX 없는 날짜만 (빠른 조회)
      (실행이 겹치면 건너뜀, 연속 실패 시 조회 간격을 2,4,8..최대 30분으로 늘림)
+     CGV 요청이 실패하면 관리자에게 바로 알림 (어느 극장, 어느 API, HTTP 코드). 같은 오류는
+     정상화될 때까지 한 번만 알리고, 정상화되면 복구 알림. 로그에는 "[API 오류]" 로 남김
      구독자가 고른 영화만 알림. 단, 극장에 처음 IMAX 예매가 열린 영화는 영화 선택과 상관없이 알림
   2) Function URL (텔레그램 웹훅) -> 구독자가 봇에서 극장/영화를 고르는 명령/버튼 처리
   3) 콘솔 테스트 이벤트       -> {"test_notify": true}, {"setup_webhook": "<Function URL>"}
@@ -56,7 +58,6 @@ HEADERS = {
     "Referer": BOOKING_URL,
 }
 REQUEST_GAP_SEC = 0.3
-FAIL_ALERT_AT = 8  # 백오프 포함 약 30분 이상 연속 실패 시 관리자에게 한 번 경고
 MAX_BACKOFF_MIN = 30
 LOCK_KEY = "scan.lock"
 LOCK_TTL_SEC = 150  # 이보다 오래된 잠금은 비정상 종료로 보고 무시
@@ -444,13 +445,56 @@ def setup_webhook(url):
 
 
 # ───────────────────────── CGV 조회 ─────────────────────────
+API_DESC = {
+    "searchSiteScnscYmdListBySite": "날짜 목록",
+    "searchMovScnInfo": "상영 회차",
+}
+
+
+class ApiError(Exception):
+    """CGV API 요청 실패. 어느 API, 어떤 파라미터, HTTP 코드, 이유를 담음"""
+
+    def __init__(self, api, params, status, reason):
+        self.api, self.params, self.status, self.reason = api, params, status, reason
+        super().__init__(self.describe())
+
+    def describe(self):
+        where = " ".join(f"{k}={v}" for k, v in self.params.items() if k in ("siteNo", "scnYmd"))
+        code = f"HTTP {self.status}" if self.status else "연결 실패"
+        return f"{self.api}({API_DESC.get(self.api, '')}) {where} -> {code} {self.reason}".strip()
+
+    def short(self):
+        """관리자 알림용 한 줄"""
+        day = self.params.get("scnYmd")
+        what = API_DESC.get(self.api, self.api) + (f" {fmt_date(day)}" if day else "")
+        code = f"HTTP {self.status}" if self.status else "연결 실패"
+        return f"{self.api} ({what}) -> {code} {self.reason}".strip()
+
+
 def get_json(path, **params):
     url = f"{BASE}/{path}?" + urllib.parse.urlencode({"coCd": CO_CD, **params})
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=15) as res:
-        body = json.load(res)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as res:
+            raw = res.read()
+    except urllib.error.HTTPError as e:
+        try:
+            page = e.read(4000).decode("utf-8", "ignore")
+        except Exception:
+            page = ""
+        reason = str(e.reason or "")
+        if "이용이 제한" in page:
+            reason += " (CGV 차단 페이지)"
+        raise ApiError(path, params, e.code, reason) from None
+    except (urllib.error.URLError, OSError) as e:  # 타임아웃, DNS, 연결 끊김
+        raise ApiError(path, params, None, str(getattr(e, "reason", e))) from None
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise ApiError(path, params, 200, "JSON이 아닌 응답 (차단 페이지일 수 있음)") from None
     if body.get("statusCode") != 0:
-        raise RuntimeError(f"{path}: {body.get('statusMessage')}")
+        raise ApiError(path, params, 200,
+                       f"statusCode {body.get('statusCode')}: {body.get('statusMessage')}")
     return body.get("data") or []
 
 
@@ -488,11 +532,12 @@ def load_state():
     data, _ = s3_get(STATE_KEY)
     if not data:
         return {"seen": set(), "tracked": set(), "failures": 0, "imax_dates": {}, "full_at": 0,
-                "known": {}}
+                "known": {}, "alerted": None}
     st = {"seen": set(data.get("seen", [])), "failures": int(data.get("failures", 0)),
           "tracked": set(data.get("tracked", [])),
           "imax_dates": {k: set(v) for k, v in (data.get("imax_dates") or {}).items()},
           "full_at": float(data.get("full_at", 0)),
+          "alerted": data.get("alerted"),  # 마지막으로 관리자에게 알린 오류 (정상이면 None)
           # 극장별로 IMAX 예매가 열린 적 있는 영화 {극장: {movNo: [이름, 마지막 상영일]}}
           # v3 에서 올라오면 비어 있음 -> 다음 조회에서 알림 없이 채움
           "known": {k: {m: list(v) for m, v in by.items()}
@@ -512,6 +557,7 @@ def save_state(st):
         "seen": sorted(k for k in st["seen"] if k[:8] >= today and key_site(k) in st["tracked"]),
         "tracked": sorted(st["tracked"]),
         "failures": st["failures"],
+        "alerted": st.get("alerted"),
         "imax_dates": {k: sorted(d for d in v if d >= today)
                        for k, v in st["imax_dates"].items() if k in st["tracked"]},
         "known": {k: {m: v for m, v in by.items() if v[1] >= forget}
@@ -576,6 +622,33 @@ def backoff_skip(failures):
     return minute % every != 0
 
 
+def notify_errors(st, failed, all_failed):
+    """CGV 요청 실패를 관리자에게 바로 알림. 같은 오류는 정상화될 때까지 한 번만, 정상화되면 복구 알림"""
+    if not failed:
+        if st.get("alerted"):
+            admin_notify("✅ CGV 조회가 다시 정상이에요")
+            st["alerted"] = None
+        return
+    sig = sorted(f"{no}|{getattr(e, 'api', type(e).__name__)}|{getattr(e, 'status', '')}"
+                 for no, e in failed)
+    if sig == st.get("alerted"):
+        return  # 이미 알린 오류
+    lines = []
+    for no, e in sorted(failed, key=lambda x: list(SEOUL_IMAX).index(x[0])):
+        detail = e.short() if isinstance(e, ApiError) else f"{type(e).__name__}: {e}"
+        lines.append(f"• {SEOUL_IMAX[no]}: {detail}"[:300])
+    if all_failed:
+        tail = (f"모든 극장 조회 실패 (연속 {st['failures']}회). "
+                f"다음 조회는 약 {min(2 ** st['failures'], MAX_BACKOFF_MIN)}분 뒤예요.")
+    else:
+        tail = "나머지 극장은 정상 조회됐어요."
+    if any(getattr(e, "status", None) == 429 for _, e in failed):
+        tail += "\n429 = CGV가 요청이 너무 많다고 거절한 거예요."
+    admin_notify(f"{ICON_WARN} CGV 조회 실패 {now_kst().strftime('%H:%M')}\n" + "\n".join(lines)
+                 + f"\n{tail}\n로그: CloudWatch /aws/lambda/cgv-test 에서 \"API 오류\" 검색")
+    st["alerted"] = sig
+
+
 def run_scan():
     if not acquire_lock():
         return "skip: previous run still in progress"
@@ -609,7 +682,7 @@ def _run_scan():
     # 극장들은 동시에 조회 (극장 안에서는 날짜를 순서대로, 요청 사이 간격 유지)
     with ThreadPoolExecutor(max_workers=len(needed)) as pool:
         futures = {no: pool.submit(scan_site, no, today, movie_kw, skips[no]) for no in needed}
-    found, ok_sites, errors = {}, set(), []
+    found, ok_sites, errors, failed = {}, set(), [], []
     for no in needed:
         try:
             f, open_dates, imax_dates = futures[no].result()
@@ -619,20 +692,18 @@ def _run_scan():
             ok_sites.add(no)
         except Exception as e:
             errors.append(f"{SEOUL_IMAX[no]}: {e}")
-            print(f"[{SEOUL_IMAX[no]}] 조회 실패: {e}")
+            failed.append((no, e))
+            print(f"[API 오류] {SEOUL_IMAX[no]} | {e}")
 
     if not ok_sites:
         st["failures"] += 1
-        if st["failures"] == FAIL_ALERT_AT:
-            admin_notify(f"{ICON_WARN} CGV 알리미 조회가 계속 실패하고 있어요\n"
-                         + "; ".join(errors)[:300] + "\nCGV API가 바뀌었거나 접속이 막혔을 수 있어요.")
+        notify_errors(st, failed, all_failed=True)
         st["tracked"] &= set(needed)
         save_state(st)
         return f"fail {st['failures']}: {'; '.join(errors)}"
 
-    if st["failures"] >= FAIL_ALERT_AT:
-        admin_notify("✅ CGV 알리미 조회가 다시 정상화됐어요")
     st["failures"] = 0
+    notify_errors(st, failed, all_failed=False)
 
     # 이전부터 추적하던 극장의 새 회차만 알림. 새로 구독자가 생긴 극장은 조용히 기준선만 저장
     new = {k: s for k, s in found.items() if k not in st["seen"] and key_site(k) in st["tracked"]}
