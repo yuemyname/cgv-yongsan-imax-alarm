@@ -8,6 +8,7 @@ CGV 서울 IMAX 예매 오픈 알리미 - AWS Lambda (서울 리전) 버전, 구
      (실행이 겹치면 건너뜀, 연속 실패 시 조회 간격을 2,4,8..최대 30분으로 늘림)
      CGV 요청이 실패하면 관리자에게 바로 알림 (어느 극장, 어느 API, HTTP 코드). 같은 오류는
      정상화될 때까지 한 번만 알리고, 정상화되면 복구 알림. 로그에는 "[API 오류]" 로 남김
+     극장 날짜 목록에 새 예매 날짜가 생기면 그 극장 구독자에게 알림 (IMAX 회차 유무 표시)
      구독자가 고른 영화만 알림. 단, 극장에 처음 IMAX 예매가 열린 영화는 영화 선택과 상관없이 알림
   2) Function URL (텔레그램 웹훅) -> 구독자가 봇에서 극장/영화를 고르는 명령/버튼 처리
   3) 콘솔 테스트 이벤트       -> {"test_notify": true}, {"setup_webhook": "<Function URL>"}
@@ -74,6 +75,7 @@ ICON_OPEN = "\U0001F3AC"
 ICON_TEST = "\U0001F514"
 ICON_WARN = "⚠️"
 ICON_NEW = "\U0001F195"
+ICON_DATE = "\U0001F4C5"
 
 s3 = boto3.client("s3")
 
@@ -213,7 +215,8 @@ def update_subs(fn):
 # ───────────────────────── 봇 (웹훅) ─────────────────────────
 HELP = ("CGV 서울 IMAX 예매 오픈 알리미예요.\n"
         "선택한 극장에 새 IMAX 회차가 열리면 1~2분 안에 알려드려요.\n"
-        "처음으로 IMAX 예매가 열린 영화는 영화 선택과 상관없이 알려드려요.\n\n"
+        "처음으로 IMAX 예매가 열린 영화는 영화 선택과 상관없이 알려드려요.\n"
+        "극장에 새 예매 날짜가 열려도 알려드려요.\n\n"
         "/settings - 알림 받을 극장 고르기\n"
         "/movies - 알림 받을 영화 고르기\n"
         "/status - 지금 설정 보기\n"
@@ -532,12 +535,14 @@ def load_state():
     data, _ = s3_get(STATE_KEY)
     if not data:
         return {"seen": set(), "tracked": set(), "failures": 0, "imax_dates": {}, "full_at": 0,
-                "known": {}, "alerted": None}
+                "known": {}, "alerted": None, "open_dates": {}}
     st = {"seen": set(data.get("seen", [])), "failures": int(data.get("failures", 0)),
           "tracked": set(data.get("tracked", [])),
           "imax_dates": {k: set(v) for k, v in (data.get("imax_dates") or {}).items()},
           "full_at": float(data.get("full_at", 0)),
           "alerted": data.get("alerted"),  # 마지막으로 관리자에게 알린 오류 (정상이면 None)
+          # 극장별로 지금까지 본 예매 날짜 (없는 극장은 다음 조회에서 알림 없이 채움)
+          "open_dates": {k: set(v) for k, v in (data.get("open_dates") or {}).items()},
           # 극장별로 IMAX 예매가 열린 적 있는 영화 {극장: {movNo: [이름, 마지막 상영일]}}
           # v3 에서 올라오면 비어 있음 -> 다음 조회에서 알림 없이 채움
           "known": {k: {m: list(v) for m, v in by.items()}
@@ -558,6 +563,8 @@ def save_state(st):
         "tracked": sorted(st["tracked"]),
         "failures": st["failures"],
         "alerted": st.get("alerted"),
+        "open_dates": {k: sorted(d for d in v if d >= today)
+                       for k, v in st["open_dates"].items() if k in st["tracked"]},
         "imax_dates": {k: sorted(d for d in v if d >= today)
                        for k, v in st["imax_dates"].items() if k in st["tracked"]},
         "known": {k: {m: v for m, v in by.items() if v[1] >= forget}
@@ -586,6 +593,21 @@ def build_alert(shows, firsts=()):
     head = (f"{ICON_NEW} 새 영화 IMAX 예매 첫 오픈! {', '.join(first_names)}\n" if first_names else "")
     return (head + f"{ICON_OPEN} IMAX 예매 오픈! {names} 새 회차 {len(shows)}개\n"
             + "\n".join(lines[:50]) + f"\n{BOOKING_URL}\n\n변경: /settings (극장), /movies (영화)")
+
+
+def build_date_alert(by_site, footer=True):
+    """by_site: {극장: {날짜: IMAX 회차 있음}}"""
+    lines = []
+    for no in SEOUL_IMAX:
+        if no in by_site:
+            days = ", ".join(fmt_date(d) + (" IMAX" if has else "")
+                             for d, has in sorted(by_site[no].items()))
+            lines.append(f"[{SEOUL_IMAX[no]}] {days}")
+    text = f"{ICON_DATE} 새 예매 날짜 오픈\n" + "\n".join(lines)
+    if footer:
+        text += (f"\n(IMAX 표시가 없는 날짜는 아직 IMAX 회차가 없어요)\n{BOOKING_URL}"
+                 "\n\n변경: /settings (극장), /movies (영화)")
+    return text
 
 
 def acquire_lock():
@@ -683,10 +705,17 @@ def _run_scan():
     with ThreadPoolExecutor(max_workers=len(needed)) as pool:
         futures = {no: pool.submit(scan_site, no, today, movie_kw, skips[no]) for no in needed}
     found, ok_sites, errors, failed = {}, set(), [], []
+    new_dates = {}  # 극장 -> {새 예매 날짜: IMAX 회차 있음 여부}
     for no in needed:
         try:
             f, open_dates, imax_dates = futures[no].result()
             found.update(f)
+            prev_dates = st["open_dates"].get(no)
+            if prev_dates is not None and no in st["tracked"]:
+                added = open_dates - prev_dates
+                if added:
+                    new_dates[no] = {d: d in imax_dates for d in added}
+            st["open_dates"][no] = (prev_dates or set()) | open_dates
             prev = st["imax_dates"].get(no, set())
             st["imax_dates"][no] = (imax_dates if not skips[no] else (prev & open_dates) | imax_dates)
             ok_sites.add(no)
@@ -725,13 +754,14 @@ def _run_scan():
 
     sent = 0
     blocked = []
-    if new:
+    if new or new_dates:
         for chat_id, u in subs.items():
             movies = u.get("movies")  # None = 전체 영화
             mine = [(key_site(k), s) for k, s in new.items()
                     if key_site(k) in u.get("sites", [])
                     and (movies is None or mov_no(s) in movies or (key_site(k), mov_no(s)) in firsts)]
-            if not mine:
+            my_dates = {no: d for no, d in new_dates.items() if no in u.get("sites", [])}
+            if not mine and not my_dates:
                 continue
             extra = {}
             if movies is not None:  # 고르지 않은 첫 오픈 영화는 바로 추가할 수 있게 버튼
@@ -741,7 +771,13 @@ def _run_scan():
                         [{"text": f"➕ {name} 알림 받기"[:60], "callback_data": f"am:{no}"[:64]}]
                         for no, name in sorted(add.items(), key=lambda x: x[1])[:8]]}
             try:
-                send(chat_id, build_alert(mine, firsts), **extra)
+                if mine and my_dates:
+                    text = build_date_alert(my_dates, footer=False) + "\n\n" + build_alert(mine, firsts)
+                elif mine:
+                    text = build_alert(mine, firsts)
+                else:
+                    text = build_date_alert(my_dates)
+                send(chat_id, text, **extra)
                 sent += 1
             except TelegramError as e:
                 print(f"{chat_id} 전송 실패: {e}")
@@ -761,6 +797,7 @@ def _run_scan():
 
     result = (f"{'full' if full else 'quick'}: subs {len(subs)}, sites {len(needed)}, "
               f"imax {len(found)}, new {len(new)}, "
+              f"dates {sum(len(v) for v in new_dates.values())}, "
               f"first {sorted(no for _, no in firsts)}, "
               f"sent {sent}, baselined {sorted(newly_tracked)}")
     if errors:
